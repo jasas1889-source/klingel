@@ -149,10 +149,42 @@
     transition: transform 0.35s cubic-bezier(.34,1.56,.64,1); z-index: 10; max-width: 90%; text-align: center;
   }
   .toast.show { transform: translateX(-50%) translateY(0); }
+  .slot-day { margin-bottom: 18px; }
+  .slot-day-label { font-size: 0.85rem; color: var(--brass-bright); font-weight: 600; margin-bottom: 8px; }
+  .slot-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px;
+    margin-bottom: 8px; font-size: 0.9rem;
+  }
+  .slot-row.free { background: var(--panel-raised); }
+  .slot-row.taken { background: transparent; color: var(--muted); }
+  .slot-time { font-weight: 600; }
+  .slot-row.taken .slot-time { font-weight: 400; }
+  .slot-status { font-size: 0.78rem; color: var(--muted); }
+  .slot-row.free .slot-status { color: var(--brass-bright); }
+  button.book-btn {
+    background: var(--brass); color: #2a1e08; border: none; border-radius: 8px;
+    padding: 8px 14px; font-family: inherit; font-weight: 600; font-size: 0.82rem; cursor: pointer;
+  }
+  .book-form { margin-top: 8px; padding-top: 10px; border-top: 1px dashed var(--line); display: none; }
+  .book-form.open { display: block; }
+  .book-form input { margin-bottom: 10px; }
 </style>
 </head>
 <body>
 <div class="wrap">
+
+  <!-- TERMIN-ANSICHT: nur sichtbar, wenn ?page=termine in der URL steht -->
+  <div id="termineArea" class="hidden">
+    <header>
+      <h1>Termine</h1>
+      <p>Freien Termin auswählen und Namen eintragen.</p>
+    </header>
+    <div class="card">
+      <div id="slotsList"></div>
+      <div class="ring-note" id="termineNote"></div>
+    </div>
+  </div>
 
   <!-- BESUCHER-ANSICHT: nur sichtbar, wenn ?room=... in der URL steht -->
   <div id="visitorArea" class="hidden">
@@ -215,14 +247,28 @@
       </div>
 
       <div class="card">
+        <label for="termineLink">Termin-Link zum Teilen</label>
+        <p style="margin:0 0 10px; font-size:0.82rem; color:var(--muted);">Wer diesen Link öffnet, sieht nur die freien und vergebenen Termine und kann einen freien Termin anfragen.</p>
+        <div class="share-row">
+          <input type="text" id="termineLink" readonly>
+          <button class="pill" id="copyTermineBtn">Kopieren</button>
+        </div>
+      </div>
+
+      <div class="card">
         <div class="section-title">Echte Push-Benachrichtigung (auch bei geschlossener Seite)</div>
         <p style="margin:0 0 12px; font-size:0.85rem; color:var(--muted); line-height:1.5;">
-          Damit du auch klingelt bekommst, wenn diese Seite nicht offen ist, installier die kostenlose App
-          <strong>ntfy</strong> (App Store / Play Store) und abonniere darin diesen Kanal:
+          Installier die kostenlose App <strong>ntfy</strong> (App Store / Play Store) und abonniere beide Kanäle:
         </p>
+        <label for="topicField">Klingel (nur für dich)</label>
         <div class="share-row">
           <input type="text" id="topicField" readonly>
           <button class="pill" id="copyTopicBtn">Kopieren</button>
+        </div>
+        <label for="termineTopicField" style="margin-top:14px;">Termine (gemeinsam)</label>
+        <div class="share-row">
+          <input type="text" id="termineTopicField" readonly>
+          <button class="pill" id="copyTermineTopicBtn">Kopieren</button>
         </div>
       </div>
 
@@ -273,14 +319,171 @@ function topicFor(name) {
   return NTFY_TOPIC_BASE + "-" + name.toLowerCase();
 }
 
-// ---------- URL-Parameter prüfen: sind wir im Besucher-Modus? ----------
+/* Terminraum: ein gemeinsamer Kanal für alle Buchungen */
+const TERMINE_TOPIC = NTFY_TOPIC_BASE + "-termine";
+
+/* HIER ANPASSEN: an welchen Wochentagen (0=So..6=Sa) und Uhrzeiten
+   Termine angeboten werden, sowie wie viele Tage im Voraus. */
+const TERMIN_WOCHENTAGE = [1, 2, 3, 4, 5, 6]; // Mo-Sa
+const TERMIN_UHRZEITEN = ["08:00", "10:00", "12:00", "14:00", "16:00"];
+const TERMIN_TAGE_VORAUS = 14;
+
+// ---------- URL-Parameter prüfen: in welchem Modus starten wir? ----------
 const params = new URLSearchParams(window.location.search);
 const roomParam = params.get('room');
+const pageParam = params.get('page');
 
-if (roomParam) {
+if (pageParam === 'termine') {
+  runTermineMode();
+} else if (roomParam) {
   runVisitorMode(roomParam);
 } else {
   runAppMode();
+}
+
+// ==================== TERMIN-MODUS ====================
+function runTermineMode() {
+  document.getElementById('appArea').classList.add('hidden');
+  document.getElementById('termineArea').classList.remove('hidden');
+
+  const base = "https://ntfy.sh/" + TERMINE_TOPIC;
+  const slotsList = document.getElementById('slotsList');
+  const note = document.getElementById('termineNote');
+  const bookedSet = new Set(); // "YYYY-MM-DD|HH:MM"
+
+  function slotKey(dateStr, time) { return dateStr + "|" + time; }
+
+  function buildSlots() {
+    const days = [];
+    const today = new Date();
+    today.setHours(0,0,0,0);
+    for (let i = 0; i < TERMIN_TAGE_VORAUS; i++) {
+      const d = new Date(today);
+      d.setDate(d.getDate() + i);
+      if (TERMIN_WOCHENTAGE.includes(d.getDay())) {
+        days.push(d);
+      }
+    }
+    return days;
+  }
+
+  function formatDateLabel(d) {
+    return d.toLocaleDateString('de-DE', { weekday: 'long', day: '2-digit', month: '2-digit' });
+  }
+  function isoDate(d) {
+    return d.toISOString().slice(0, 10);
+  }
+
+  function render() {
+    slotsList.innerHTML = '';
+    const days = buildSlots();
+    days.forEach(d => {
+      const dateStr = isoDate(d);
+      const dayWrap = document.createElement('div');
+      dayWrap.className = 'slot-day';
+      const label = document.createElement('div');
+      label.className = 'slot-day-label';
+      label.textContent = formatDateLabel(d);
+      dayWrap.appendChild(label);
+
+      TERMIN_UHRZEITEN.forEach(time => {
+        const key = slotKey(dateStr, time);
+        const taken = bookedSet.has(key);
+        const row = document.createElement('div');
+        row.className = 'slot-row ' + (taken ? 'taken' : 'free');
+
+        const left = document.createElement('div');
+        const timeSpan = document.createElement('span');
+        timeSpan.className = 'slot-time';
+        timeSpan.textContent = time + ' Uhr';
+        left.appendChild(timeSpan);
+
+        if (taken) {
+          const status = document.createElement('div');
+          status.className = 'slot-status';
+          status.textContent = 'Vergeben';
+          row.appendChild(left);
+          row.appendChild(status);
+        } else {
+          const bookBtn = document.createElement('button');
+          bookBtn.className = 'book-btn';
+          bookBtn.textContent = 'Anfragen';
+          const wrapRight = document.createElement('div');
+          wrapRight.appendChild(bookBtn);
+          row.appendChild(left);
+          row.appendChild(wrapRight);
+
+          const form = document.createElement('div');
+          form.className = 'book-form';
+          form.innerHTML =
+            '<label>Name</label>' +
+            '<input type="text" class="bookName" maxlength="40">' +
+            '<label>Telefon (optional)</label>' +
+            '<input type="text" class="bookPhone" maxlength="30">' +
+            '<button class="primary confirmBook">Termin anfragen</button>';
+
+          bookBtn.addEventListener('click', () => {
+            form.classList.toggle('open');
+          });
+
+          form.querySelector('.confirmBook').addEventListener('click', async () => {
+            const nameVal = form.querySelector('.bookName').value.trim();
+            const phoneVal = form.querySelector('.bookPhone').value.trim();
+            if (!nameVal) {
+              note.textContent = 'Bitte einen Namen eintragen.';
+              return;
+            }
+            if (bookedSet.has(key)) {
+              note.textContent = 'Dieser Termin wurde gerade eben schon vergeben.';
+              await refresh();
+              return;
+            }
+            const payload = JSON.stringify({ date: dateStr, time: time, name: nameVal, phone: phoneVal });
+            try {
+              await fetch(base, {
+                method: 'POST',
+                headers: { 'Title': 'Neue Terminanfrage', 'Tags': 'spiral_calendar_pad' },
+                body: payload
+              });
+              bookedSet.add(key);
+              note.textContent = 'Termin angefragt für ' + formatDateLabel(d) + ', ' + time + ' Uhr.';
+              render();
+            } catch (e) {
+              note.textContent = 'Senden fehlgeschlagen - Internetverbindung prüfen.';
+            }
+          });
+
+          const container = document.createElement('div');
+          container.appendChild(row);
+          container.appendChild(form);
+          dayWrap.appendChild(container);
+          return;
+        }
+        dayWrap.appendChild(row);
+      });
+      slotsList.appendChild(dayWrap);
+    });
+  }
+
+  async function refresh() {
+    try {
+      const res = await fetch(base + "/json?poll=1&since=" + (TERMIN_TAGE_VORAUS + 1) + "d");
+      const text = await res.text();
+      const lines = text.trim().split('\n').filter(Boolean);
+      lines.forEach(line => {
+        try {
+          const obj = JSON.parse(line);
+          if (obj.event !== 'message') return;
+          const data = JSON.parse(obj.message);
+          if (data.date && data.time) bookedSet.add(slotKey(data.date, data.time));
+        } catch (e) {}
+      });
+    } catch (e) {}
+    render();
+  }
+
+  refresh();
+  setInterval(refresh, 8000);
 }
 
 // ==================== BESUCHER-MODUS ====================
@@ -336,8 +539,12 @@ function runAppMode() {
   const logoutBtn = document.getElementById('logoutBtn');
   const shareLink = document.getElementById('shareLink');
   const copyBtn = document.getElementById('copyBtn');
+  const termineLink = document.getElementById('termineLink');
+  const copyTermineBtn = document.getElementById('copyTermineBtn');
   const topicField = document.getElementById('topicField');
   const copyTopicBtn = document.getElementById('copyTopicBtn');
+  const termineTopicField = document.getElementById('termineTopicField');
+  const copyTermineTopicBtn = document.getElementById('copyTermineTopicBtn');
   const notifToggle = document.getElementById('notifToggle');
   const notifStatus = document.getElementById('notifStatus');
   const logEl = document.getElementById('log');
@@ -470,6 +677,51 @@ function runAppMode() {
     setTimeout(() => { copyTopicBtn.textContent = 'Kopieren'; }, 1600);
   });
 
+  copyTermineTopicBtn.addEventListener('click', async () => {
+    termineTopicField.select();
+    try {
+      await navigator.clipboard.writeText(termineTopicField.value);
+      copyTermineTopicBtn.textContent = 'Kopiert!';
+    } catch (e) {
+      document.execCommand('copy');
+      copyTermineTopicBtn.textContent = 'Kopiert!';
+    }
+    setTimeout(() => { copyTermineTopicBtn.textContent = 'Kopieren'; }, 1600);
+  });
+
+  function startListeningTermine() {
+    const termineBase = "https://ntfy.sh/" + TERMINE_TOPIC;
+    const es = new EventSource(termineBase + "/sse");
+    es.onmessage = (e) => {
+      try {
+        const obj = JSON.parse(e.data);
+        if (obj.event !== 'message') return;
+        let text = 'Neue Terminanfrage';
+        try {
+          const data = JSON.parse(obj.message);
+          text = 'Termin: ' + data.name + ' - ' + data.date + ' ' + data.time + ' Uhr';
+        } catch (err) {}
+        showToast(text);
+        beep();
+        if (notifEnabled && 'Notification' in window && Notification.permission === 'granted') {
+          try { new Notification('Neue Terminanfrage', { body: text }); } catch (err) {}
+        }
+      } catch (err) {}
+    };
+  }
+
+  copyTermineBtn.addEventListener('click', async () => {
+    termineLink.select();
+    try {
+      await navigator.clipboard.writeText(termineLink.value);
+      copyTermineBtn.textContent = 'Kopiert!';
+    } catch (e) {
+      document.execCommand('copy');
+      copyTermineBtn.textContent = 'Kopiert!';
+    }
+    setTimeout(() => { copyTermineBtn.textContent = 'Kopieren'; }, 1600);
+  });
+
   function enterApp(name) {
     loginCard.classList.add('hidden');
     mainArea.classList.remove('hidden');
@@ -477,10 +729,13 @@ function runAppMode() {
 
     const roomUrl = window.location.origin + window.location.pathname + '?room=' + encodeURIComponent(name.toLowerCase());
     shareLink.value = roomUrl;
+    termineLink.value = window.location.origin + window.location.pathname + '?page=termine';
     topicField.value = topicFor(name);
+    termineTopicField.value = TERMINE_TOPIC;
 
     const base = "https://ntfy.sh/" + topicFor(name);
     loadHistory(base).then(() => startListening(base));
+    startListeningTermine();
   }
 
   loginBtn.addEventListener('click', () => {
